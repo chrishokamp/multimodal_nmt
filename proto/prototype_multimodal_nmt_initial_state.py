@@ -10,6 +10,13 @@ import numpy
 from fuel.datasets import IterableDataset
 from fuel.transformers import Merge
 from fuel.streams import DataStream
+from fuel.datasets import TextFile
+from fuel.schemes import ConstantScheme
+from fuel.streams import DataStream
+from fuel.transformers import (
+    Merge, Batch, Filter, Padding, SortMapping, Unpack, Mapping)
+
+from six.moves import cPickle
 
 from blocks.bricks import (Tanh, Maxout, Linear, FeedforwardSequence,
                            Bias, Initializable, MLP)
@@ -25,6 +32,8 @@ from blocks.roles import add_role, WEIGHT
 from blocks.utils import shared_floatx_nans
 
 from machine_translation.models import MinRiskSequenceGenerator
+
+from mmmt.stream import get_tr_stream_with_context_features, get_dev_stream_with_context_features
 
 from picklable_itertools.extras import equizip
 
@@ -57,13 +66,15 @@ logger.setLevel(logging.DEBUG)
 
 # as long as the arrays fit in memory, we should be able to use iterable dataset
 
+# TODO: move configuration to yaml ASAP
 TRAIN_IMAGE_FEATURES = '/media/1tb_drive/multilingual-multimodal/flickr30k/img_features/f30k-translational-newsplits/train.npz'
 DEV_IMAGE_FEATURES = '/media/1tb_drive/multilingual-multimodal/flickr30k/img_features/f30k-translational-newsplits/dev.npz'
 TEST_IMAGE_FEATURES = '/media/1tb_drive/multilingual-multimodal/flickr30k/img_features/f30k-translational-newsplits/test.npz'
 
 # the prototype config for NMT experiment with images
 
-BASEDIR = '/media/1tb_drive/multilingual-multimodal/flickr30k/train/processed/BERTHA-TEST_Adam_wmt-multimodal_internal_data_dropout'+          '0.3_ff_noiseFalse_search_model_en2es_vocab20000_emb300_rec800_batch15/'
+BASEDIR = '/media/1tb_drive/multilingual-multimodal/flickr30k/train/processed/BERTHA-TEST_Adam_wmt-multimodal_internal_data_dropout'+\
+          '0.3_ff_noiseFalse_search_model_en2es_vocab20000_emb300_rec800_batch15/'
 #best_bleu_model_1455464992_BLEU31.61.npz
 
 exp_config = {
@@ -148,121 +159,6 @@ exp_config = {
 }
 
 
-from machine_translation.stream import _ensure_special_tokens, _length, PaddingWithEOS, _oov_to_unk, _too_long
-
-def get_tr_stream_with_context_features(src_vocab, trg_vocab, src_data, trg_data, context_features,
-                  src_vocab_size=30000, trg_vocab_size=30000, unk_id=1,
-                  seq_len=50, batch_size=80, sort_k_batches=12, **kwargs):
-    """Prepares the training data stream."""
-
-    def _get_np_array(filename):
-        return numpy.load(filename)['arr_0']
-    
-    # Load dictionaries and ensure special tokens exist
-    src_vocab = _ensure_special_tokens(
-        src_vocab if isinstance(src_vocab, dict)
-        else cPickle.load(open(src_vocab)),
-        bos_idx=0, eos_idx=src_vocab_size - 1, unk_idx=unk_id)
-    trg_vocab = _ensure_special_tokens(
-        trg_vocab if isinstance(trg_vocab, dict) else
-        cPickle.load(open(trg_vocab)),
-        bos_idx=0, eos_idx=trg_vocab_size - 1, unk_idx=unk_id)
-
-    # Get text files from both source and target
-    src_dataset = TextFile([src_data], src_vocab, None)
-    trg_dataset = TextFile([trg_data], trg_vocab, None)
-
-    # Merge them to get a source, target pair
-    stream = Merge([src_dataset.get_example_stream(),
-                    trg_dataset.get_example_stream()],
-                   ('source', 'target'))
-
-    # Filter sequences that are too long
-    stream = Filter(stream,
-                    predicate=_too_long(seq_len=seq_len))
-    
-  
-    # Replace out of vocabulary tokens with unk token
-    # TODO: doesn't the TextFile stream do this anyway?
-    stream = Mapping(stream,
-                     _oov_to_unk(src_vocab_size=src_vocab_size,
-                                 trg_vocab_size=trg_vocab_size,
-                                 unk_id=unk_id))
-
-    # now add the source with the image features
-    # create the image datastream (iterate over a file line-by-line)
-    train_features = _get_np_array(context_features)
-    train_feature_dataset = IterableDataset(train_features)
-    train_image_stream = DataStream(train_feature_dataset)
-
-    stream = Merge([stream, train_image_stream], ('source', 'target', 'initial_context'))
-    
-    # Build a batched version of stream to read k batches ahead
-    stream = Batch(stream,
-                   iteration_scheme=ConstantScheme(
-                       batch_size*sort_k_batches))
-
-    # Sort all samples in the read-ahead batch
-    stream = Mapping(stream, SortMapping(_length))
-
-    # Convert it into a stream again
-    stream = Unpack(stream)
-
-    # Construct batches from the stream with specified batch size
-    stream = Batch(
-        stream, iteration_scheme=ConstantScheme(batch_size))
-
-    # Pad sequences that are short
-    masked_stream = PaddingWithEOS(
-        stream, [src_vocab_size - 1, trg_vocab_size - 1], mask_sources=('source', 'target'))
-
-    return masked_stream, src_vocab, trg_vocab
-
-
-# Remember that the BleuValidator does hackish stuff to get target set information from the main_loop data_stream
-# using all kwargs here makes it more clear that this function is always called with get_dev_stream(**config_dict)
-def get_dev_stream_with_context_features(val_context_features=None, val_set=None, src_vocab=None,
-                                         src_vocab_size=30000, unk_id=1, **kwargs):
-    """Setup development set stream if necessary."""
-    
-    def _get_np_array(filename):
-        return numpy.load(filename)['arr_0']
-    
-    
-    dev_stream = None
-    if val_set is not None and src_vocab is not None:
-        src_vocab = _ensure_special_tokens(
-            src_vocab if isinstance(src_vocab, dict) else
-            cPickle.load(open(src_vocab)),
-            bos_idx=0, eos_idx=src_vocab_size - 1, unk_idx=unk_id)
-        
-        # TODO: how is the dev dataset used without the context features?
-        dev_dataset = TextFile([val_set], src_vocab, None)
-        
-        # now add the source with the image features
-        # create the image datastream (iterate over a file line-by-line)
-        con_features = _get_np_array(val_context_features)
-        con_feature_dataset = IterableDataset(con_features)
-        valid_image_stream = DataStream(con_feature_dataset)
-        
-        dev_stream = DataStream(dev_dataset)
-        dev_stream = Merge([dev_dataset.get_example_stream(),
-                            valid_image_stream], ('source', 'initial_context'))
-#         dev_stream = dev_stream.get_example_stream()
-
-    return dev_stream
-
-
-# In[8]:
-
-from fuel.datasets import TextFile
-from fuel.schemes import ConstantScheme
-from fuel.streams import DataStream
-from fuel.transformers import (
-    Merge, Batch, Filter, Padding, SortMapping, Unpack, Mapping)
-
-from six.moves import cPickle
-
 # setting up the experiment
     
 # args = parser.parse_args()
@@ -281,407 +177,6 @@ config_obj = exp_config
 
 train_stream, source_vocab, target_vocab = get_tr_stream_with_context_features(**config_obj)
 dev_stream = get_dev_stream_with_context_features(**config_obj)
-
-
-class GRUInitialStateWithInitialStateContext(GatedRecurrent):
-    """Gated Recurrent with special initial state.
-
-    Initial state of Gated Recurrent is set by an MLP that conditions on the
-    last hidden state of the bidirectional encoder, applies an affine
-    transformation followed by a tanh non-linearity to set initial state.
-
-    """
-    def __init__(self, attended_dim, context_dim, **kwargs):
-        super(GRUInitialStateWithInitialStateContext, self).__init__(**kwargs)
-        self.attended_dim = attended_dim
-        self.context_dim = context_dim
-
-        self.initial_transformer = MLP(activations=[Tanh(),Tanh(),Tanh()],
-                                       dims=[attended_dim + context_dim, 1000, 500, self.dim],
-                                       name='state_initializer')
-        self.children.append(self.initial_transformer)
-  
-    # WORKING: add the images as another context to the recurrent transition
-    # THINKING: how to best combine the image info with the source info?
-    @application
-    def initial_states(self, batch_size, *args, **kwargs):
-        attended = kwargs['attended']
-        context = kwargs['initial_state_context']
-        attended_reverse_final_state = attended[0, :, -self.attended_dim:]
-        concat_attended_and_context = tensor.concatenate([attended_reverse_final_state, context], axis=1)
-        initial_state = self.initial_transformer.apply(concat_attended_and_context)
-        return initial_state
-
-    def _allocate(self):
-        self.parameters.append(shared_floatx_nans((self.dim, self.dim),
-                               name='state_to_state'))
-        self.parameters.append(shared_floatx_nans((self.dim, 2 * self.dim),
-                               name='state_to_gates'))
-        for i in range(2):
-            if self.parameters[i]:
-                add_role(self.parameters[i], WEIGHT)
-
-
-# In[15]:
-
-from abc import ABCMeta, abstractmethod
-
-from theano import tensor
-from six import add_metaclass
-
-from blocks.bricks import (Brick, Initializable, Sequence,
-                           Feedforward, Linear, Tanh)
-from blocks.bricks.base import lazy, application
-from blocks.bricks.parallel import Parallel, Distribute
-from blocks.bricks.recurrent import recurrent, BaseRecurrent
-from blocks.utils import dict_union, dict_subset, pack
-
-from blocks.bricks.attention import AttentionRecurrent
-
-class InitialContextAttentionRecurrent(AttentionRecurrent):
-    
-    def __init__(self, *args, **kwargs):
-        super(InitialContextAttentionRecurrent, self).__init__(*args, **kwargs)
-#         print('CONTEXT NAMES:')
-#         print(self._context_names)
-#         self._context_names.append('initial_state_context')
-#         print('CONTEXT NAMES:')
-#         print(self._context_names)
-        
-#     @application
-#     def compute_states(self, **kwargs):
-#         r"""Compute current states when glimpses have already been computed.
-
-#         Combines an application of the `distribute` that alter the
-#         sequential inputs of the wrapped transition and an application of
-#         the wrapped transition. All unknown keyword arguments go to
-#         the wrapped transition.
-
-#         Parameters
-#         ----------
-#         \*\*kwargs
-#             Should contain everything what `self.transition` needs
-#             and in addition the current glimpses.
-
-#         Returns
-#         -------
-#         current_states : list of :class:`~tensor.TensorVariable`
-#             Current states computed by `self.transition`.
-
-#         """
-#         # make sure we are not popping the mask
-#         normal_inputs = [name for name in self._sequence_names
-#                          if 'mask' not in name]
-#         sequences = dict_subset(kwargs, normal_inputs, pop=True)
-#         glimpses = dict_subset(kwargs, self._glimpse_names, pop=True)
-#         if self.add_contexts:
-#             kwargs.pop(self.attended_name)
-#             # attended_mask_name can be optional
-#             kwargs.pop(self.attended_mask_name, None)
-            
-        
-
-#         sequences.update(self.distribute.apply(
-#             as_dict=True, **dict_subset(dict_union(sequences, glimpses),
-#                                         self.distribute.apply.inputs)))
-#         current_states = self.transition.apply(
-#             iterate=False, as_list=True,
-#             **dict_union(sequences, kwargs))
-#         return current_states
-    
-#     @recurrent
-#     def do_apply(self, **kwargs):
-#         r"""Process a sequence attending the attended context every step.
-
-#         In addition to the original sequence this method also requires
-#         its preprocessed version, the one computed by the `preprocess`
-#         method of the attention mechanism. Unknown keyword arguments
-#         are passed to the wrapped transition.
-
-#         Parameters
-#         ----------
-#         \*\*kwargs
-#             Should contain current inputs, previous step states, contexts,
-#             the preprocessed attended context, previous step glimpses.
-
-#         Returns
-#         -------
-#         outputs : list of :class:`~tensor.TensorVariable`
-#             The current step states and glimpses.
-
-#         """
-#         attended = kwargs[self.attended_name]
-#         preprocessed_attended = kwargs.pop(self.preprocessed_attended_name)
-#         attended_mask = kwargs.get(self.attended_mask_name)
-#         sequences = dict_subset(kwargs, self._sequence_names, pop=True,
-#                                 must_have=False)
-#         states = dict_subset(kwargs, self._state_names, pop=True)
-#         glimpses = dict_subset(kwargs, self._glimpse_names, pop=True)
-
-#         current_glimpses = self.take_glimpses(
-#             as_dict=True,
-#             **dict_union(
-#                 states, glimpses,
-#                 {self.attended_name: attended,
-#                  self.attended_mask_name: attended_mask,
-#                  self.preprocessed_attended_name: preprocessed_attended}))
-#         current_states = self.compute_states(
-#             as_list=True,
-#             **dict_union(sequences, states, current_glimpses, kwargs))
-#         return current_states + list(current_glimpses.values())
-    
-    
-#     @do_apply.property('contexts')
-#     def do_apply_contexts(self):
-#         return self._context_names + [self.preprocessed_attended_name] + ['initial_state_context']
-#         return self._context_names + [self.preprocessed_attended_name]
-
-
-# In[16]:
-
-# WORKING: sequence generator which uses the contexts properly
-
-from abc import ABCMeta, abstractmethod
-
-from six import add_metaclass
-from theano import tensor
-
-from blocks.bricks import Initializable, Random, Bias, NDimensionalSoftmax
-from blocks.bricks.base import application, Brick, lazy
-from blocks.bricks.parallel import Fork, Merge
-from blocks.bricks.lookup import LookupTable
-from blocks.bricks.recurrent import recurrent
-from blocks.bricks.attention import (
-    AbstractAttentionRecurrent, AttentionRecurrent)
-from blocks.roles import add_role, COST
-from blocks.utils import dict_union, dict_subset
-
-from blocks.bricks.sequence_generators import BaseSequenceGenerator
-
-class InitialContextSequenceGenerator(BaseSequenceGenerator):
-    
-    def __init__(self, readout, transition, attention=None,
-                 add_contexts=True, **kwargs):
-        normal_inputs = [name for name in transition.apply.sequences
-                         if 'mask' not in name]
-        kwargs.setdefault('fork', Fork(normal_inputs))
-        if attention:
-            transition = InitialContextAttentionRecurrent(
-#             transition = AttentionRecurrent(
-                transition, attention,
-                add_contexts=add_contexts, name="att_trans")
-        else:
-            transition = FakeAttentionRecurrent(transition,
-                                                name="with_fake_attention")
-        super(InitialContextSequenceGenerator, self).__init__(
-            readout, transition, **kwargs)
-    
-#     def __init__(self, *args, **kwargs):
-#         self.softmax = NDimensionalSoftmax()
-#         super(InitialContextSequenceGenerator, self).__init__(*args, **kwargs)
-#         self.children.append(self.softmax)
-
-    @application
-    def cost_matrix(self, application_call, outputs, mask=None, **kwargs):
-        """Returns generation costs for output sequences.
-
-        See Also
-        --------
-        :meth:`cost` : Scalar cost.
-
-        """
-        # We assume the data has axes (time, batch, features, ...)
-        batch_size = outputs.shape[1]
-
-        # Prepare input for the iterative part
-        states = dict_subset(kwargs, self._state_names, must_have=False)
-        # masks in context are optional (e.g. `attended_mask`)
-#         contexts = dict_subset(kwargs, self._context_names, must_have=False)
-        contexts = dict_subset(kwargs, self._context_names, must_have=False)
-        contexts['initial_state_context'] = kwargs['initial_state_context']
-    
-        feedback = self.readout.feedback(outputs)
-        inputs = self.fork.apply(feedback, as_dict=True)
-
-        # Run the recurrent network
-        results = self.transition.apply(
-            mask=mask, return_initial_states=True, as_dict=True,
-            **dict_union(inputs, states, contexts))
-
-        # Separate the deliverables. The last states are discarded: they
-        # are not used to predict any output symbol. The initial glimpses
-        # are discarded because they are not used for prediction.
-        # Remember, glimpses are computed _before_ output stage, states are
-        # computed after.
-        states = {name: results[name][:-1] for name in self._state_names}
-        glimpses = {name: results[name][1:] for name in self._glimpse_names}
-
-        # Compute the cost
-        feedback = tensor.roll(feedback, 1, 0)
-        feedback = tensor.set_subtensor(
-            feedback[0],
-            self.readout.feedback(self.readout.initial_outputs(batch_size)))
-        readouts = self.readout.readout(
-            feedback=feedback, **dict_union(states, glimpses, contexts))
-        costs = self.readout.cost(readouts, outputs)
-        if mask is not None:
-            costs *= mask
-
-        for name, variable in list(glimpses.items()) + list(states.items()):
-            application_call.add_auxiliary_variable(
-                variable.copy(), name=name)
-
-        # This variables can be used to initialize the initial states of the
-        # next batch using the last states of the current batch.
-        for name in self._state_names + self._glimpse_names:
-            application_call.add_auxiliary_variable(
-                results[name][-1].copy(), name=name+"_final_value")
-
-        return costs
-
-
-from theano import tensor
-from toolz import merge
-
-from blocks.bricks import (Tanh, Maxout, Linear, FeedforwardSequence,
-                           Bias, Initializable, MLP)
-from blocks.bricks.attention import SequenceContentAttention
-from blocks.bricks.base import application
-from blocks.bricks.lookup import LookupTable
-from blocks.bricks.parallel import Fork
-from blocks.bricks.recurrent import GatedRecurrent, Bidirectional
-from blocks.bricks.sequence_generators import (
-    LookupFeedback, Readout, SoftmaxEmitter,
-    SequenceGenerator)
-from blocks.roles import add_role, WEIGHT
-from blocks.utils import shared_floatx_nans
-
-from machine_translation.models import MinRiskSequenceGenerator
-
-from picklable_itertools.extras import equizip
-
-from machine_translation.model import LookupFeedbackWMT15, InitializableFeedforwardSequence
-
-# TODO: a lot of code was duplicated here during speedy prototyping -- CLEAN UP
-class InitialContextDecoder(Initializable):
-    """
-    Decoder which incorporates context features into the target-side initial state
-
-    Parameters:
-    -----------
-    vocab_size: int
-    embedding_dim: int
-    representation_dim: int
-    theano_seed: int
-    loss_function: str : {'cross_entropy'(default) | 'min_risk'}
-
-    """
-
-    def __init__(self, vocab_size, embedding_dim, state_dim,
-                 representation_dim, context_dim, theano_seed=None, loss_function='cross_entropy', **kwargs):
-        super(InitialContextDecoder, self).__init__(**kwargs)
-        self.vocab_size = vocab_size
-        self.embedding_dim = embedding_dim
-        self.state_dim = state_dim
-        self.representation_dim = representation_dim
-        self.theano_seed = theano_seed
-
-        # Initialize gru with special initial state
-        self.transition = GRUInitialStateWithInitialStateContext(
-            attended_dim=state_dim, context_dim=context_dim, dim=state_dim,
-            activation=Tanh(), name='decoder')
-
-        # Initialize the attention mechanism
-        self.attention = SequenceContentAttention(
-            state_names=self.transition.apply.states,
-            attended_dim=representation_dim,
-            match_dim=state_dim, name="attention")
-
-        # Initialize the readout, note that SoftmaxEmitter emits -1 for
-        # initial outputs which is used by LookupFeedBackWMT15
-        readout = Readout(
-            source_names=['states', 'feedback',
-                          # Chris: it's key that we're taking the first output of self.attention.take_glimpses.outputs
-                          # Chris: the first output is the weighted avgs, the second is the weights in (batch, time)
-                          self.attention.take_glimpses.outputs[0]],
-            readout_dim=self.vocab_size,
-            emitter=SoftmaxEmitter(initial_output=-1, theano_seed=theano_seed),
-            feedback_brick=LookupFeedbackWMT15(vocab_size, embedding_dim),
-            post_merge=InitializableFeedforwardSequence(
-                [Bias(dim=state_dim, name='maxout_bias').apply,
-                 Maxout(num_pieces=2, name='maxout').apply,
-                 Linear(input_dim=state_dim / 2, output_dim=embedding_dim,
-                        use_bias=False, name='softmax0').apply,
-                 Linear(input_dim=embedding_dim, name='softmax1').apply]),
-            merged_dim=state_dim)
-
-        # Build sequence generator accordingly
-        if loss_function == 'cross_entropy':
-            self.sequence_generator = InitialContextSequenceGenerator(
-                readout=readout,
-                transition=self.transition,
-                attention=self.attention,
-                fork=Fork([name for name in self.transition.apply.sequences
-                           if name != 'mask'], prototype=Linear())
-            )
-#         elif loss_function == 'min_risk':
-#             self.sequence_generator = MinRiskSequenceGenerator(
-#                 readout=readout,
-#                 transition=self.transition,
-#                 attention=self.attention,
-#                 fork=Fork([name for name in self.transition.apply.sequences
-#                            if name != 'mask'], prototype=Linear())
-#             )
-            # the name is important, because it lets us match the brick hierarchy names for the vanilla SequenceGenerator
-            # to load pretrained models
-            self.sequence_generator.name = 'sequencegenerator'
-        else:
-            raise ValueError('The decoder does not support the loss function: {}'.format(loss_function))
-
-        self.children = [self.sequence_generator]
-
-    @application(inputs=['representation', 'source_sentence_mask',
-                         'target_sentence_mask', 'target_sentence', 'initial_state_context'],
-                 outputs=['cost'])
-    def cost(self, representation, source_sentence_mask,
-             target_sentence, target_sentence_mask, initial_state_context):
-
-        source_sentence_mask = source_sentence_mask.T
-        target_sentence = target_sentence.T
-        target_sentence_mask = target_sentence_mask.T
-
-        # Get the cost matrix
-        cost = self.sequence_generator.cost_matrix(**{
-            'mask': target_sentence_mask,
-            'outputs': target_sentence,
-            'attended': representation,
-            'attended_mask': source_sentence_mask,
-            'initial_state_context': initial_state_context
-            }
-        )
-
-        return (cost * target_sentence_mask).sum() /             target_sentence_mask.shape[1]
-
-    # Note: this requires the decoder to be using sequence_generator which implements expected cost
-#     @application(inputs=['representation', 'source_sentence_mask',
-#                          'target_samples_mask', 'target_samples', 'scores'],
-#                  outputs=['cost'])
-#     def expected_cost(self, representation, source_sentence_mask, target_samples, target_samples_mask, scores,
-#                       **kwargs):
-#         return self.sequence_generator.expected_cost(representation,
-#                                                      source_sentence_mask,
-#                                                      target_samples, target_samples_mask, scores, **kwargs)
-
-
-    @application
-    def generate(self, source_sentence, representation, initial_state_context, **kwargs):
-        return self.sequence_generator.generate(
-            n_steps=2 * source_sentence.shape[1],
-            batch_size=source_sentence.shape[0],
-            attended=representation,
-            attended_mask=tensor.ones(source_sentence.shape).T,
-            initial_state_context=initial_state_context,
-            **kwargs)
 
 
 # WORKING: make beam search and sampling work nicely with the new context
@@ -712,7 +207,7 @@ class SamplingBase(object):
     """Utility class for BleuValidator and Sampler."""
 
     def _get_attr_rec(self, obj, attr):
-        return self._get_attr_rec(getattr(obj, attr), attr)             if hasattr(obj, attr) else obj
+        return self._get_attr_rec(getattr(obj, attr), attr) if hasattr(obj, attr) else obj
 
     def _get_true_length(self, seq, vocab):
         try:
@@ -930,7 +425,7 @@ class BleuValidator(SimpleExtension, SamplingBase):
 
             # draw sample, checking to ensure we don't get an empty string back
             # beam search param names come from WHERE??
-            trans, costs =                 self.beam_search.search(
+            trans, costs = self.beam_search.search(
                     input_values={self.source_sentence: input_,
                                   self.initial_context: context_input_},
                     max_length=3*len(seq), eol_symbol=self.eos_idx,
@@ -987,7 +482,6 @@ class BleuValidator(SimpleExtension, SamplingBase):
         logger.info(bleu_score)
         mb_subprocess.terminate()
 
-
         return bleu_score
 
     def _is_valid_to_save(self, bleu_score):
@@ -1035,8 +529,9 @@ class ModelInfo:
             (int(time.time()), self.bleu_score) if path else None)
         return gen_path
 
+# END SAMPLING AND VALIDATION
 
-# In[ ]:
+# MODEL CREATION AND TRAINING
 
 import logging
 
@@ -1070,6 +565,8 @@ from machine_translation.model import BidirectionalEncoder, Decoder
 from machine_translation.stream import (get_tr_stream, get_dev_stream,
                                         _ensure_special_tokens)
 
+from mmmt.model import InitialContextSequenceGenerator, InitialContextDecoder
+
 try:
     from blocks_extras.extensions.plot import Plot
     BOKEH_AVAILABLE = True
@@ -1088,9 +585,7 @@ def main(config, tr_stream, dev_stream, use_bokeh=False):
     target_sentence = tensor.lmatrix('target')
     target_sentence_mask = tensor.matrix('target_mask')
     initial_context = tensor.matrix('initial_context')
-    
 
-    
     # Construct model
     logger.info('Building RNN encoder-decoder')
     encoder = BidirectionalEncoder(
@@ -1192,7 +687,6 @@ def main(config, tr_stream, dev_stream, use_bokeh=False):
         sampling_representation = encoder.apply(
             sampling_input, tensor.ones(sampling_input.shape))
         
-        # TODO: decoder generate function also needs to include the new initial contexts in the kwargs
         generated = decoder.generate(sampling_input, sampling_representation, sampling_context)
         search_model = Model(generated)
         _, samples = VariableFilter(

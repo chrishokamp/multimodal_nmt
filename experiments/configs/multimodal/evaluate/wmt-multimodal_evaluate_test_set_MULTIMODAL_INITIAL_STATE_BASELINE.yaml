@@ -1,0 +1,165 @@
+# Model related -----------------------------------------------------------
+# Sequences longer than this will be discarded
+'seq_len': 40
+# Number of hidden units in encoder/decoder GRU
+'enc_nhids': &REC_SIZE 800
+'dec_nhids': 800
+
+# Dimension of the word embedding matrix in encoder/decoder
+'enc_embed': &EMBED_SIZE 300
+'dec_embed': 300
+
+# Multimodal
+'context_dim': 4096
+
+# Optimization related ----------------------------------------------------
+# Batch size
+'batch_size': &BATCH_SIZE 15
+
+# This many batches will be read ahead and sorted
+'sort_k_batches': 15
+
+# Optimization step rule
+'step_rule': 'AdaDelta'
+
+# Gradient clipping threshold
+'step_clipping': 1.
+
+# Std of weight initialization
+'weight_scale': 0.01
+
+# Regularization related --------------------------------------------------
+
+# Weight noise flag for feed forward layers
+'weight_noise_ff': &FF_NOISE False
+
+# Weight noise flag for recurrent layers
+'weight_noise_rec': False
+
+# Dropout ratio, applied only after readout maxout
+'dropout': &DROPOUT 0.3
+
+# Source and target vocabulary sizes, should include bos, eos, unk tokens
+'src_vocab_size': &SRC_VOCAB_SIZE 20000
+'trg_vocab_size': &TGT_VOCAB_SIZE 20000
+
+# Special tokens and indexes
+'unk_id': 1
+'bos_token': '<S>'
+'eos_token': '</S>'
+'unk_token': '<UNK>'
+
+# Root directory for dataset
+#'datadir': &DATADIR /media/1tb_drive/parallel_data/en-de/chris_en-de_big_corpus/train/processed
+'datadir': &DATADIR /media/1tb_drive/multilingual-multimodal/flickr30k/train/processed
+
+# the name of the directory where the model will be saved and checkpointed
+#'model_save_directory': &SAVEDIR !format_str ['unbabel_data_dropout{}_ff_noise{}_search_model_en2es_vocab{}_emb{}_rec{}_batch{}', *DROPOUT, *FF_NOISE, *SRC_VOCAB_SIZE, *EMBED_SIZE, *REC_SIZE, *BATCH_SIZE]
+'model_save_directory': &SAVEDIR wmt-multimodal_internal_data_dropout0.3_ff_noiseFalse_search_model_en2es_vocab20000_emb300_rec800_batch15 
+
+# Where to save model, this corresponds to 'prefix' in groundhog
+'saveto': &OUTPUT_DIR !path_join [*DATADIR, *SAVEDIR]
+
+# Module name of the stream that will be used
+# note this requires the stream to be implemented as a module -- there may be a better way
+'stream': 'stream'
+
+# Source and target vocabularies
+'src_vocab': !path_join [*DATADIR, 'vocab.en-de.en.pkl']
+'trg_vocab': !path_join [*DATADIR, 'vocab.en-de.de.pkl']
+
+# Source and target datasets
+'src_data': !path_join [*DATADIR, 'train.en.tok.shuf']
+'trg_data': !path_join [*DATADIR, 'train.de.tok.shuf']
+
+#'context_features': '/media/1tb_drive/multilingual-multimodal/flickr30k/img_features/f30k-translational-newsplits/train.npz',
+#'val_context_features': '/media/1tb_drive/multilingual-multimodal/flickr30k/img_features/f30k-translational-newsplits/dev.npz',
+
+# Normalize cost according to sequence length after beam-search
+'normalized_bleu': True
+
+# Bleu script that will be used (moses multi-perl in this case)
+'bleu_script': !path_join [*DATADIR, 'multi-bleu.perl']
+
+# Validation set source file
+'val_set': !path_join [*DATADIR, 'dev.en.tok']
+
+# Validation set gold file
+'val_set_grndtruth': !path_join [*DATADIR, 'dev.de.tok']
+
+# Print validation output to file
+'output_val_set': True
+
+# Validation output file
+'val_set_out': !path_join [*OUTPUT_DIR, 'validation_out.txt']
+
+# Beam-size
+'beam_size': 20 
+
+# Timing/monitoring related -----------------------------------------------
+
+# Maximum number of updates
+'finish_after': 1000000
+
+# Reload model from files if exist
+'reload': True
+
+# Save model after this many updates
+'save_freq': 5000
+
+# Show samples from model after this many updates
+'sampling_freq': 5000
+
+# Show this many samples at each sampling
+'hook_samples': 5
+
+# Validate bleu after this many updates
+'bleu_val_freq': 1000 
+
+# Start bleu validation after this many updates
+'val_burn_in': 5000
+
+# PREDICTION
+'source_lang': 'en'
+'target_lang': 'de'
+
+'n_best': 1 
+
+# path to the moses perl script for tokenization
+'tokenize_script': ~ 
+# path to the moses perl script for detokenization
+'detokenize_script': ~
+
+# The location of the saved parameters of a trained model as .npz
+# TODO: model save directory is currently misnamed -- switch to yaml configs with good model names
+'saved_parameters': '/media/1tb_drive/test_min_risk_model_save/best_bleu_model_1461248083_BLEU29.60.npz'
+
+# contexts for mmmt
+#'test_context_features': '/media/1tb_drive/multilingual-multimodal/flickr30k/img_features/f30k-translational-newsplits/test.npz'
+'test_context_features': '/media/1tb_drive/multilingual-multimodal/flickr30k/img_features/f30k-translational-newsplits/dev.npz'
+
+# The location of a test set in the source language
+#'test_set': '/home/chris/projects/neural_mt/test_data/sample_experiment/tiny_demo_dataset/newstest2013.tiny.en.tok'
+#'test_set': '/home/chris/projects/neural_mt/experiments/test_datasets/wmt15/dev/newstest2013.en.tok'
+#'test_set': '/home/chris/projects/neural_mt/experiments/test_datasets/unbabel/test/unbabel-general.test.en.tok'
+#'test_set': '/media/1tb_drive/multilingual-multimodal/flickr30k/test/test.en.tok'
+'test_set': '/media/1tb_drive/multilingual-multimodal/flickr30k/train/processed/dev.en.tok'
+#'test_set': '/media/1tb_drive/parallel_data/en-de/chris_en-de_big_corpus/train/processed/newstest2013.en.tok'
+
+# your desired path to the translated output file, or an already-translated file that you just want to evaluate
+#'translated_output_file': '/media/1tb_drive/multilingual-multimodal/flickr30k/test/test.29.96BLEU.internal.min-risk.hyps.out'
+#'translated_output_file': '/media/1tb_drive/multilingual-multimodal/flickr30k/train/processed/test.16.x.chris-large.hyps.out'
+'translated_output_file': '/media/1tb_drive/multilingual-multimodal/flickr30k/train/processed/dev.multimodal-baseline.29.x.hyps.out'
+
+# The location of the gold standard references for the test set (for evaluation mode only)
+#'test_gold_refs': '/home/chris/projects/neural_mt/test_data/sample_experiment/tiny_demo_dataset/newstest2013.tiny.es.tok'
+#'test_gold_refs': '/home/chris/projects/neural_mt/experiments/test_datasets/dev/newstest2013.tiny.en.tok''
+#'test_gold_refs': '/media/1tb_drive/multilingual-multimodal/flickr30k/test/test.de.tok'
+'test_gold_refs': '/media/1tb_drive/multilingual-multimodal/flickr30k/train/processed/dev.de.tok'
+#'test_gold_refs': '/media/1tb_drive/parallel_data/en-de/chris_en-de_big_corpus/train/processed/newstest2013.de.tok'
+
+# if the config contains this key, meteor will also be computed
+'meteor_directory': '/home/chris/programs/meteor-1.5'
+
+
+
