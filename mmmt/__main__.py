@@ -1,11 +1,3 @@
-"""Encoder-Decoder with search for machine translation.
-
-Please see `prepare_data.py` for preprocessing configuration
-
-.. [BCB] Dzmitry Bahdanau, Kyunghyun Cho and Yoshua Bengio. Neural
-   Machine Translation by Jointly Learning to Align and Translate.
-"""
-
 from __future__ import print_function
 import argparse
 import logging
@@ -18,15 +10,13 @@ from subprocess import Popen, PIPE, check_output
 
 from machine_translation import configurations
 
-# from mmmt import main, NMTPredictor
-from mmmt import  NMTPredictor
+from mmmt import main, NMTPredictor
 from mmmt.stream import get_tr_stream_with_context_features, get_dev_stream_with_context_features
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# Get the arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("exp_config",
                     help="Path to the yaml config file for your experiment")
@@ -48,17 +38,20 @@ if __name__ == "__main__":
     logger.info("Model Configuration:\n{}".format(pprint.pformat(config_obj)))
 
     # TODO: organize mmmt code so that we can implement train for mmmt
-    # if mode == 'train':
-        # Get data streams and call main
-        # main(config_obj, get_tr_stream(**config_obj),
-        #      get_dev_stream(**config_obj), args.bokeh)
-    # elif mode == 'predict':
+    # TODO: support specifying target transition via config
+    # TODO: use eval() to get the target transition we want
 
-    # TODO: add 'test_context_features' to mmmt prediction configs
-    if mode == 'predict':
+    if mode == 'train':
+        # Get data streams and call main
+        train_stream, source_vocab, target_vocab = get_tr_stream_with_context_features(**config_obj)
+        dev_stream = get_dev_stream_with_context_features(**config_obj)
+        main(config_obj, train_stream, dev_stream, source_vocab, target_vocab, args.bokeh)
+
+    elif mode == 'predict':
         predictor = NMTPredictor(config_obj)
         predictor.predict_files(config_obj['test_set'], config_obj['test_context_features'],
                                 config_obj.get('translated_output_file', None))
+
     elif mode == 'evaluate':
         logger.info("Started Evaluation: ")
         val_start_time = time.time()
@@ -79,7 +72,6 @@ if __name__ == "__main__":
                                                                            translated_output_file))
 
         # BLEU
-        # get gold refs
         multibleu_cmd = ['perl', config_obj['bleu_script'],
                          config_obj['test_gold_refs'], '<']
 

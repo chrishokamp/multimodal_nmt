@@ -28,6 +28,22 @@ from blocks.bricks.sequence_generators import (
 from blocks.roles import add_role, WEIGHT
 from blocks.utils import shared_floatx_nans
 
+from abc import ABCMeta, abstractmethod
+
+from six import add_metaclass
+from theano import tensor
+
+from blocks.bricks import Initializable, Random, Bias, NDimensionalSoftmax
+from blocks.bricks.base import application, Brick, lazy
+from blocks.bricks.parallel import Fork, Merge
+from blocks.bricks.lookup import LookupTable
+from blocks.bricks.recurrent import recurrent
+from blocks.bricks.attention import (
+    AbstractAttentionRecurrent, AttentionRecurrent)
+from blocks.roles import add_role, COST
+from blocks.utils import dict_union, dict_subset
+
+from blocks.bricks.sequence_generators import BaseSequenceGenerator
 from machine_translation.models import MinRiskSequenceGenerator
 
 from picklable_itertools.extras import equizip
@@ -36,8 +52,7 @@ from machine_translation.model import LookupFeedbackWMT15, InitializableFeedforw
 
 
 
-
-class GRUInitialStateWithInitialStateContext(GatedRecurrent):
+class GRUInitialStateWithInitialStateSumContext(GatedRecurrent):
     """Gated Recurrent with special initial state.
 
     Initial state of Gated Recurrent is set by an MLP that conditions on the
@@ -46,7 +61,55 @@ class GRUInitialStateWithInitialStateContext(GatedRecurrent):
 
     """
     def __init__(self, attended_dim, context_dim, **kwargs):
-        super(GRUInitialStateWithInitialStateContext, self).__init__(**kwargs)
+        super(GRUInitialStateWithInitialStateSumContext, self).__init__(**kwargs)
+        self.attended_dim = attended_dim
+        self.context_dim = context_dim
+
+        # two MLPs which map to the same dimension, then we sum
+        # the motivation here is to allow the network to pretrain on the normal MT, task,
+        # then keep some params static, and continue training with the context-enhanced task
+        # the state transformer
+        self.initial_transformer = MLP(activations=[Tanh()],
+                                       dims=[attended_dim, self.dim],
+                                       name='state_initializer')
+
+        # the context transformer
+        self.context_transformer = MLP(activations=[Tanh(),Tanh(),Tanh()],
+                                       dims=[context_dim, 2000, 1000, self.dim],
+                                       name='context_initializer')
+
+        self.children.extend([self.initial_transformer, self.context_transformer])
+
+    # THINKING: how to best combine the image info with the source info?
+    @application
+    def initial_states(self, batch_size, *args, **kwargs):
+        attended = kwargs['attended']
+        context = kwargs['initial_state_context']
+        attended_reverse_final_state = attended[0, :, -self.attended_dim:]
+        initial_state_representation = self.initial_transformer.apply(attended_reverse_final_state)
+        initial_context_representation = self.context_transformer.apply(context)
+        initial_state = initial_state_representation + initial_context_representation
+        return initial_state
+
+    def _allocate(self):
+        self.parameters.append(shared_floatx_nans((self.dim, self.dim),
+                                                  name='state_to_state'))
+        self.parameters.append(shared_floatx_nans((self.dim, 2 * self.dim),
+                                                  name='state_to_gates'))
+        for i in range(2):
+            if self.parameters[i]:
+                add_role(self.parameters[i], WEIGHT)
+
+class GRUInitialStateWithInitialStateConcatContext(GatedRecurrent):
+    """Gated Recurrent with special initial state.
+
+    Initial state of Gated Recurrent is set by an MLP that conditions on the
+    last hidden state of the bidirectional encoder, applies an affine
+    transformation followed by a tanh non-linearity to set initial state.
+
+    """
+    def __init__(self, attended_dim, context_dim, **kwargs):
+        super(GRUInitialStateWithInitialStateConcatContext, self).__init__(**kwargs)
         self.attended_dim = attended_dim
         self.context_dim = context_dim
 
@@ -75,25 +138,6 @@ class GRUInitialStateWithInitialStateContext(GatedRecurrent):
             if self.parameters[i]:
                 add_role(self.parameters[i], WEIGHT)
 
-
-# WORKING: sequence generator which uses the contexts properly
-
-from abc import ABCMeta, abstractmethod
-
-from six import add_metaclass
-from theano import tensor
-
-from blocks.bricks import Initializable, Random, Bias, NDimensionalSoftmax
-from blocks.bricks.base import application, Brick, lazy
-from blocks.bricks.parallel import Fork, Merge
-from blocks.bricks.lookup import LookupTable
-from blocks.bricks.recurrent import recurrent
-from blocks.bricks.attention import (
-    AbstractAttentionRecurrent, AttentionRecurrent)
-from blocks.roles import add_role, COST
-from blocks.utils import dict_union, dict_subset
-
-from blocks.bricks.sequence_generators import BaseSequenceGenerator
 
 # TODO: Note that AttentionRecurrent is currently _hacked_ in blocks to remove 'initial_state_context' from the
 # TODO: kwargs in the `compute_states` function
@@ -170,7 +214,7 @@ class InitialContextSequenceGenerator(BaseSequenceGenerator):
         return costs
 
 
-# TODO: a lot of code was duplicated here during speedy prototyping -- CLEAN UP
+# TODO: a lot of code was duplicated from neural_mt during speedy prototyping -- CLEAN UP
 class InitialContextDecoder(Initializable):
     """
     Decoder which incorporates context features into the target-side initial state
@@ -186,8 +230,10 @@ class InitialContextDecoder(Initializable):
     """
 
     def __init__(self, vocab_size, embedding_dim, state_dim,
-                 representation_dim, context_dim, theano_seed=None, loss_function='cross_entropy', **kwargs):
+                 representation_dim, context_dim, target_transition,
+                 theano_seed=None, loss_function='cross_entropy', **kwargs):
         super(InitialContextDecoder, self).__init__(**kwargs)
+
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
         self.state_dim = state_dim
@@ -195,7 +241,11 @@ class InitialContextDecoder(Initializable):
         self.theano_seed = theano_seed
 
         # Initialize gru with special initial state
-        self.transition = GRUInitialStateWithInitialStateContext(
+        self.target_transition = target_transition(
+            attended_dim=state_dim, context_dim=context_dim, dim=state_dim,
+            activation=Tanh(), name='decoder')
+
+        self.transition = GRUInitialStateWithInitialStateConcatContext(
             attended_dim=state_dim, context_dim=context_dim, dim=state_dim,
             activation=Tanh(), name='decoder')
 

@@ -1,3 +1,5 @@
+'run_name': &RUN_NAME SUM_INITIAL_STATE_BASELINE
+
 # Model related -----------------------------------------------------------
 # Sequences longer than this will be discarded
 'seq_len': 40
@@ -10,11 +12,14 @@
 'dec_embed': 300
 
 # Multimodal
+# NEW PARAMS FOR ADDING CONTEXT FEATURES
+'context_features': '/media/1tb_drive/multilingual-multimodal/flickr30k/img_features/f30k-translational-newsplits/train.npz'
+'val_context_features': '/media/1tb_drive/multilingual-multimodal/flickr30k/img_features/f30k-translational-newsplits/dev.npz'
 'context_dim': 4096
 
 # Optimization related ----------------------------------------------------
 # Batch size
-'batch_size': &BATCH_SIZE 15
+'batch_size': &BATCH_SIZE 40
 
 # This many batches will be read ahead and sorted
 'sort_k_batches': 15
@@ -27,6 +32,9 @@
 
 # Std of weight initialization
 'weight_scale': 0.01
+
+# the target transition that specifies how the context features are incorporated
+'target_transition': GRUInitialStateWithInitialStateSumContext
 
 # Regularization related --------------------------------------------------
 
@@ -55,7 +63,8 @@
 
 # the name of the directory where the model will be saved and checkpointed
 #'model_save_directory': &SAVEDIR !format_str ['unbabel_data_dropout{}_ff_noise{}_search_model_en2es_vocab{}_emb{}_rec{}_batch{}', *DROPOUT, *FF_NOISE, *SRC_VOCAB_SIZE, *EMBED_SIZE, *REC_SIZE, *BATCH_SIZE]
-'model_save_directory': &SAVEDIR wmt-multimodal_internal_data_dropout0.3_ff_noiseFalse_search_model_en2es_vocab20000_emb300_rec800_batch15 
+'model_save_directory': &SAVEDIR !format_str ['wmt16-multimodal_{}_internal_data_dropout{}_src_vocab{}_trg_vocab{}_emb{}_rec{}_batch{}',
+                                              *RUN_NAME, *DROPOUT, *SRC_VOCAB_SIZE, *TGT_VOCAB_SIZE, *EMBED_SIZE, *REC_SIZE, *BATCH_SIZE]
 
 # Where to save model, this corresponds to 'prefix' in groundhog
 'saveto': &OUTPUT_DIR !path_join [*DATADIR, *SAVEDIR]
@@ -114,10 +123,10 @@
 'hook_samples': 5
 
 # Validate bleu after this many updates
-'bleu_val_freq': 1000 
+'bleu_val_freq': 200
 
 # Start bleu validation after this many updates
-'val_burn_in': 5000
+'val_burn_in': 1000
 
 # PREDICTION
 'source_lang': 'en'
