@@ -1,3 +1,8 @@
+"""
+Functions and classes for sampling from MMMT models
+
+"""
+
 from __future__ import print_function
 
 import logging
@@ -8,6 +13,9 @@ import re
 import signal
 import time
 import theano
+import subprocess
+import codecs
+import tempfile
 
 from blocks.extensions import SimpleExtension
 from blocks.search import BeamSearch
@@ -20,6 +28,44 @@ logger = logging.getLogger(__name__)
 # this is to let us use all of the sources in the fuel dev stream
 # without needing to explicitly filter them
 theano.config.on_unused_input = 'warn'
+
+
+
+import numpy
+
+# TODO: implement this function for MMMT
+class SampleFunc:
+
+    def __init__(self, sample_func, vocab):
+        self.sample_func = sample_func
+        self.vocab = vocab
+
+    # TODO: we may be able to make this function faster by passing multiple sources for sampling at the same damn time
+    # TODO: or by avoiding the for loop somehow
+    def __call__(self, source_seq, initial_context, num_samples=1):
+
+        source_inputs = numpy.tile(source_seq[None, :], (num_samples, 1))
+        context_inputs = numpy.tile(initial_context[None, :], (num_samples, 1))
+
+        # the output is [seq_len, batch]
+        # TODO: make sure the order of arguments is correct, because we used model.get_theano_function
+        _1, outputs, _2, _3, costs = self.sample_func(source_inputs, context_inputs)
+        outputs = outputs.T
+
+        # TODO: this step could be avoided by computing the samples mask in a different way
+        lens = self._get_true_length(outputs)
+        samples = [s[:l] for s,l in zip(outputs.tolist(), lens)]
+
+        return samples
+
+    def _get_true_length(self, seqs):
+        try:
+            lens = []
+            for r in seqs.tolist():
+                lens.append(r.index(self.vocab['</S>']) + 1)
+            return lens
+        except ValueError:
+            return [seqs.shape[1] for _ in range(seqs.shape[0])]
 
 
 class SamplingBase(object):
@@ -146,14 +192,11 @@ class Sampler(SimpleExtension, SamplingBase):
 
 
 class BleuValidator(SimpleExtension, SamplingBase):
-    # TODO: a lot has been changed in NMT, sync respectively
-    # TODO: there is a mistake here when the source and target vocabulary sizes are different -- fix the ""Helpers" section below
     """Implements early stopping based on BLEU score."""
 
     def __init__(self, source_sentence, initial_state_context, samples, model, data_stream,
                  config, src_vocab=None, trg_vocab=None, n_best=1, track_n_models=1,
                  normalize=True, **kwargs):
-        # TODO: change config structure
         super(BleuValidator, self).__init__(**kwargs)
         self.source_sentence = source_sentence
         self.initial_context = initial_state_context
@@ -177,7 +220,7 @@ class BleuValidator(SimpleExtension, SamplingBase):
         self.multibleu_cmd = ['perl', self.config['bleu_script'],
                               self.config['val_set_grndtruth'], '<']
 
-        # Create saving directory if it does not exist
+        # Create save directory if it does not exist
         if not os.path.exists(self.config['saveto']):
             os.makedirs(self.config['saveto'])
 
@@ -191,7 +234,7 @@ class BleuValidator(SimpleExtension, SamplingBase):
                 for i, bleu in enumerate(
                         sorted(self.val_bleu_curve, reverse=True)):
                     if i < self.track_n_models:
-                        self.best_models.append(ModelInfo(bleu))
+                        self.best_models.append(ModelInfo(bleu, key='BLEU'))
                 logger.info("BleuScores Reloaded")
             except:
                 logger.info("BleuScores not Found")
@@ -199,7 +242,7 @@ class BleuValidator(SimpleExtension, SamplingBase):
     def do(self, which_callback, *args):
 
         # Track validation burn in
-        if self.main_loop.status['iterations_done'] <=                 self.config['val_burn_in']:
+        if self.main_loop.status['iterations_done'] <= self.config['val_burn_in']:
             return
 
         # Evaluate the model
@@ -311,7 +354,7 @@ class BleuValidator(SimpleExtension, SamplingBase):
 
     def _save_model(self, bleu_score):
         if self._is_valid_to_save(bleu_score):
-            model = ModelInfo(bleu_score, self.config['saveto'])
+            model = ModelInfo(bleu_score, self.config['saveto'], key='BLEU')
 
             # Manage n-best model list first
             if len(self.best_models) >= self.track_n_models:
@@ -322,7 +365,7 @@ class BleuValidator(SimpleExtension, SamplingBase):
                 self.best_models.remove(old_model)
 
             self.best_models.append(model)
-            self.best_models.sort(key=operator.attrgetter('bleu_score'))
+            self.best_models.sort(key=operator.attrgetter('score'))
 
             # Save the model here
             s = signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -335,15 +378,216 @@ class BleuValidator(SimpleExtension, SamplingBase):
             signal.signal(signal.SIGINT, s)
 
 
+class MeteorValidator(SimpleExtension, SamplingBase):
+    """Implements early stopping based on METEOR score."""
+
+    def __init__(self, source_sentence, initial_state_context, samples, model, data_stream,
+                 config, src_vocab=None, trg_vocab=None, n_best=1, track_n_models=1,
+                 normalize=True, **kwargs):
+        super(MeteorValidator, self).__init__(**kwargs)
+        self.source_sentence = source_sentence
+        self.initial_context = initial_state_context
+
+        self.src_vocab = src_vocab
+        self.trg_vocab = trg_vocab
+
+        self.samples = samples
+        self.model = model
+        self.data_stream = data_stream
+        self.config = config
+        self.n_best = n_best
+        self.track_n_models = track_n_models
+        self.normalize = normalize
+        self.verbose = config.get('val_set_out', None)
+
+        # Helpers
+        self.best_models = []
+        self.val_meteor_curve = []
+        self.beam_search = BeamSearch(samples=samples)
+
+        # Info for Meteor
+        self.target_language = self.config['target_lang']
+        self.meteor_directory = self.config['meteor_directory']
+
+        # Create save directory if it does not exist
+        if not os.path.exists(self.config['saveto']):
+            os.makedirs(self.config['saveto'])
+
+        if self.config['reload']:
+            try:
+                meteor_score = numpy.load(os.path.join(self.config['saveto'],
+                                                       'val_meteor_scores.npz'))
+                self.val_meteor_curve = meteor_score['meteor_scores'].tolist()
+
+                # Track n best previous meteor scores
+                for i, meteor in enumerate(
+                        sorted(self.val_meteor_curve, reverse=True)):
+                    if i < self.track_n_models:
+                        self.best_models.append(ModelInfo(meteor, key='METEOR'))
+                logger.info("MeteorScores Reloaded")
+            except:
+                logger.info("MeteorScores not Found")
+
+    def do(self, which_callback, *args):
+
+        # Track validation burn in
+        if self.main_loop.status['iterations_done'] <= self.config['val_burn_in']:
+            return
+
+        # Evaluate the model
+        meteor_score = self._evaluate_model()
+        # add an entry to the log
+        self.main_loop.log.current_row['validation_set_meteor_score'] = meteor_score
+        # save if necessary
+        self._save_model(meteor_score)
+
+    # TODO: if we are evaluating both BLEU and METEOR, we shouldn't need to translate twice!!
+    def _evaluate_model(self):
+        # Set in the superclass -- SamplingBase
+        if not hasattr(self, 'target_dataset'):
+            self._initialize_dataset_info()
+
+        self.unk_sym = '<UNK>'
+        self.eos_sym = '</S>'
+        self.unk_idx = self.trg_vocab[self.unk_sym]
+        self.eos_idx = self.trg_vocab[self.eos_sym]
+
+        logger.info("Started Validation: ")
+        val_start_time = time.time()
+
+        ref_file = self.config['val_set_grndtruth']
+        # TODO: write all hyps to temp file for meteor
+        trg_hyp_file = tempfile.NamedTemporaryFile(delete=False)
+
+        if self.verbose:
+            ftrans = codecs.open(self.config['val_set_out'], 'w', encoding='utf8')
+
+        total_cost = 0.0
+        with codecs.open(trg_hyp_file.name, 'w', encoding='utf8') as hyps_out:
+            for i, line in enumerate(self.data_stream.get_epoch_iterator()):
+                """
+                Load the sentence, retrieve the sample, write to file
+                """
+
+                # TODO: the section with beam search and translation is shared by all validators
+                seq = self._oov_to_unk(
+                    line[0], self.config['src_vocab_size'], self.unk_idx)
+
+                # TODO: the index is different when we are doing min-risk
+                initial_state_context = line[-1]
+
+                input_ = numpy.tile(seq, (self.config['beam_size'], 1))
+                context_input_ = numpy.tile(initial_state_context, (self.config['beam_size'], 1))
+
+                # draw sample, checking to ensure we don't get an empty string back
+                trans, costs = self.beam_search.search(
+                    input_values={self.source_sentence: input_,
+                                  self.initial_context: context_input_},
+                        max_length=3*len(seq), eol_symbol=self.eos_idx,
+                        ignore_first_eol=True)
+
+                # normalize costs according to the sequence lengths
+                if self.normalize:
+                    lengths = numpy.array([len(s) for s in trans])
+                    costs = costs / lengths
+
+                nbest_idx = numpy.argsort(costs)[:self.n_best]
+                for j, best in enumerate(nbest_idx):
+                    try:
+                        total_cost += costs[best]
+                        trans_out = trans[best]
+
+                        # convert idx to words
+                        trans_out = self._idx_to_word(trans_out, self.trg_ivocab)
+
+                    except ValueError:
+                        logger.info(
+                            "Can NOT find a translation for line: {}".format(i+1))
+                        trans_out = '<UNK>'
+
+                    if j == 0:
+                        # Write to subprocess and file if it exists
+                        hyps_out.write(trans_out.decode('utf8') + '\n')
+                        if self.verbose:
+                            print(trans_out.decode('utf8'), file=ftrans)
+
+                if i != 0 and i % 100 == 0:
+                    logger.info(
+                        "Translated {} lines of validation set...".format(i))
+
+            logger.info("Total cost of the validation: {}".format(total_cost))
+
+            self.data_stream.reset()
+            if self.verbose:
+                ftrans.close()
+
+        meteor_cmd = ['java', '-Xmx4G', '-jar', os.path.join(self.meteor_directory, 'meteor-1.5.jar'),
+                      trg_hyp_file.name, ref_file, '-l', self.target_language, '-norm']
+
+        meteor_output = subprocess.check_output(meteor_cmd)
+        meteor_score = float(meteor_output.strip().split('\n')[-1].split()[-1])
+        logger.info('METEOR SCORE: {}'.format(meteor_score))
+
+        logger.info("Meteor Validation Took: {} minutes".format(float(time.time() - val_start_time) / 60.))
+
+        return meteor_score
+
+    def _is_valid_to_save(self, meteor_score):
+        if not self.best_models or min(self.best_models,
+                                       key=operator.attrgetter('score')).score < meteor_score:
+            return True
+        return False
+
+    def _save_model(self, meteor_score):
+        if self._is_valid_to_save(meteor_score):
+            model = ModelInfo(meteor_score, self.config['saveto'], key='METEOR')
+
+            # Manage n-best model list first
+            if len(self.best_models) >= self.track_n_models:
+                old_model = self.best_models[0]
+                if old_model.path and os.path.isfile(old_model.path):
+                    logger.info("Deleting old model %s" % old_model.path)
+                    os.remove(old_model.path)
+                self.best_models.remove(old_model)
+
+            self.best_models.append(model)
+            self.best_models.sort(key=operator.attrgetter('score'))
+
+            # Save the model here
+            s = signal.signal(signal.SIGINT, signal.SIG_IGN)
+            logger.info("Saving new model {}".format(model.path))
+
+            SaveLoadUtils.save_parameter_values(self.main_loop.model.get_parameter_values(), model.path)
+            numpy.savez(
+                os.path.join(self.config['saveto'], 'val_meteor_scores.npz'),
+                meteor_scores=self.val_meteor_curve)
+            signal.signal(signal.SIGINT, s)
+
 class ModelInfo:
     """Utility class to keep track of evaluated models."""
 
-    def __init__(self, bleu_score, path=None):
-        self.bleu_score = bleu_score
+    def __init__(self, score, path=None, key='SCORE'):
+        self.score = score
+        self.key = key
         self.path = self._generate_path(path)
 
     def _generate_path(self, path):
         gen_path = os.path.join(
-            path, 'best_bleu_model_%d_BLEU%.2f.npz' %
-                  (int(time.time()), self.bleu_score) if path else None)
+            path, 'best_model_%d_%s%.2f.npz' %
+                  (int(time.time()), self.key, self.score) if path else None)
         return gen_path
+
+
+# TODO: remove this old code once Meteor min-risk MMMT is working
+# class ModelInfo:
+#     """Utility class to keep track of evaluated models."""
+#
+#     def __init__(self, bleu_score, path=None):
+#         self.bleu_score = bleu_score
+#         self.path = self._generate_path(path)
+#
+#     def _generate_path(self, path):
+#         gen_path = os.path.join(
+#             path, 'best_bleu_model_%d_BLEU%.2f.npz' %
+#                   (int(time.time()), self.bleu_score) if path else None)
+#         return gen_path

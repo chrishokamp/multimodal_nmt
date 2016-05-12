@@ -50,7 +50,8 @@ if __name__ == "__main__":
     elif mode == 'predict':
         predictor = NMTPredictor(config_obj)
         predictor.predict_files(config_obj['test_set'], config_obj['test_context_features'],
-                                config_obj.get('translated_output_file', None))
+                                output_file=config_obj.get('translated_output_file', None),
+                                output_costs=config_obj.get('output_cost', False))
 
     elif mode == 'evaluate':
         logger.info("Started Evaluation: ")

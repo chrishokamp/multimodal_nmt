@@ -51,6 +51,40 @@ from picklable_itertools.extras import equizip
 from machine_translation.model import LookupFeedbackWMT15, InitializableFeedforwardSequence
 
 
+# This is copied from machine translation so we can pop the 'context_dim' kwarg, and use it with the same
+# interface as the other transitions
+class GRUInitialState(GatedRecurrent):
+    """Gated Recurrent with special initial state.
+
+    Initial state of Gated Recurrent is set by an MLP that conditions on the
+    last hidden state of the bidirectional encoder, applies an affine
+    transformation followed by a tanh non-linearity to set initial state.
+
+    """
+    def __init__(self, attended_dim, context_dim, **kwargs):
+        super(GRUInitialState, self).__init__(**kwargs)
+        self.attended_dim = attended_dim
+        self.initial_transformer = MLP(activations=[Tanh()],
+                                       dims=[attended_dim, self.dim],
+                                       name='state_initializer')
+        self.children.append(self.initial_transformer)
+
+    @application
+    def initial_states(self, batch_size, *args, **kwargs):
+        attended = kwargs['attended']
+        initial_state = self.initial_transformer.apply(
+            attended[0, :, -self.attended_dim:])
+        return initial_state
+
+    def _allocate(self):
+        self.parameters.append(shared_floatx_nans((self.dim, self.dim),
+                               name='state_to_state'))
+        self.parameters.append(shared_floatx_nans((self.dim, 2 * self.dim),
+                               name='state_to_gates'))
+        for i in range(2):
+            if self.parameters[i]:
+                add_role(self.parameters[i], WEIGHT)
+
 
 class GRUInitialStateWithInitialStateSumContext(GatedRecurrent):
     """Gated Recurrent with special initial state.
@@ -141,6 +175,8 @@ class GRUInitialStateWithInitialStateConcatContext(GatedRecurrent):
 
 # TODO: Note that AttentionRecurrent is currently _hacked_ in blocks to remove 'initial_state_context' from the
 # TODO: kwargs in the `compute_states` function
+# TODO: this hack will need to be redone every time blocks is updated/re-installed
+# Working: implement expected_cost for this sequence generator, follow nnmt.models
 class InitialContextSequenceGenerator(BaseSequenceGenerator):
 
     def __init__(self, readout, transition, attention,
@@ -149,7 +185,6 @@ class InitialContextSequenceGenerator(BaseSequenceGenerator):
                          if 'mask' not in name]
         kwargs.setdefault('fork', Fork(normal_inputs))
         transition = AttentionRecurrent(
-            #             transition = AttentionRecurrent(
             transition, attention,
             add_contexts=add_contexts, name="att_trans")
         super(InitialContextSequenceGenerator, self).__init__(
@@ -214,6 +249,117 @@ class InitialContextSequenceGenerator(BaseSequenceGenerator):
         return costs
 
 
+class MinRiskInitialContextSequenceGenerator(InitialContextSequenceGenerator):
+
+    def __init__(self, *args, **kwargs):
+        self.softmax = NDimensionalSoftmax()
+        super(MinRiskInitialContextSequenceGenerator, self).__init__(*args, **kwargs)
+        self.children.append(self.softmax)
+
+    @application
+    def probs(self, readouts):
+        return self.softmax.apply(readouts, extra_ndim=readouts.ndim - 2)
+
+    # TODO: check where 'target_samples_mask' is used -- do we need a mask for context features (probably not)
+    # Note: the @application decorator inspects the arguments, and transparently adds args  ('application_call')
+    @application(inputs=['representation', 'source_sentence_mask',
+                         'target_samples_mask', 'target_samples', 'scores'],
+                 outputs=['cost'])
+    def expected_cost(self, application_call, representation, source_sentence_mask,
+                      target_samples, target_samples_mask, scores, smoothing_constant=0.005,
+                      **kwargs):
+        """
+        emulate the process in sequence_generator.cost_matrix, but compute log probabilities instead of costs
+        for each sample, we need its probability according to the model (these could actually be passed from the
+        sampling model, which could be more efficient)
+        """
+
+        # Transpose everything (note we can use transpose here only if it's 2d, otherwise we need dimshuffle)
+        source_sentence_mask = source_sentence_mask.T
+
+        # make samples (time, batch)
+        samples = target_samples.T
+        samples_mask = target_samples_mask.T
+
+        # we need this to set the 'attended' kwarg
+        keywords = {
+            'mask': target_samples_mask,
+            'outputs': target_samples,
+            'attended': representation,
+            'attended_mask': source_sentence_mask
+        }
+
+        batch_size = samples.shape[1]
+
+        # Prepare input for the iterative part
+        states = dict_subset(keywords, self._state_names, must_have=False)
+        # masks in context are optional (e.g. `attended_mask`)
+        # contexts = dict_subset(keywords, self._context_names, must_have=False)
+
+        # add the initial state context features
+        contexts = dict_subset(keywords, self._context_names, must_have=False)
+        contexts['initial_state_context'] = kwargs['initial_state_context']
+
+        feedback = self.readout.feedback(samples)
+        inputs = self.fork.apply(feedback, as_dict=True)
+
+        # Run the recurrent network
+        results = self.transition.apply(
+            mask=samples_mask, return_initial_states=True, as_dict=True,
+            **dict_union(inputs, states, contexts))
+
+        # Separate the deliverables. The last states are discarded: they
+        # are not used to predict any output symbol. The initial glimpses
+        # are discarded because they are not used for prediction.
+        # Remember, glimpses are computed _before_ output stage, states are
+        # computed after.
+        states = {name: results[name][:-1] for name in self._state_names}
+        glimpses = {name: results[name][1:] for name in self._glimpse_names}
+
+        # Compute the cost
+        feedback = tensor.roll(feedback, 1, 0)
+        feedback = tensor.set_subtensor(
+            feedback[0],
+            self.readout.feedback(self.readout.initial_outputs(batch_size)))
+        readouts = self.readout.readout(
+            feedback=feedback, **dict_union(states, glimpses, contexts))
+
+        word_probs = self.probs(readouts)
+        word_probs = tensor.log(word_probs)
+
+        # Note: converting the samples to one-hot wastes space, but it gets the job done
+        # TODO: this may be the op that sometimes causes out-of-memory
+        one_hot_samples = tensor.eye(word_probs.shape[-1])[samples]
+        one_hot_samples.astype('float32')
+        actual_probs = word_probs * one_hot_samples
+
+        # reshape to (batch, time, prob), then sum over the batch dimension
+        # to get sequence-level probability
+        actual_probs = actual_probs.dimshuffle(1,0,2)
+        # we are first summing over vocabulary (only one non-zero cell per row)
+        sequence_probs = actual_probs.sum(axis=2)
+        sequence_probs = sequence_probs * target_samples_mask
+        # now sum over time dimension
+        sequence_probs = sequence_probs.sum(axis=1)
+
+        # reshape and do exp() to get the true probs back
+        # sequence_probs = tensor.exp(sequence_probs.reshape(scores.shape))
+        sequence_probs = sequence_probs.reshape(scores.shape)
+
+        # Note that the smoothing constant can be set by user
+        sequence_distributions = (tensor.exp(sequence_probs*smoothing_constant) /
+                                  tensor.exp(sequence_probs*smoothing_constant)
+                                  .sum(axis=1, keepdims=True))
+
+        # the following lines are done explicitly for code clarity
+        # -- first get sequence expectation, then sum up the expectations for every
+        # seq in the minibatch
+        expected_scores = (sequence_distributions * scores).sum(axis=1)
+        expected_scores = expected_scores.sum(axis=0)
+
+        return expected_scores
+
+
 # TODO: a lot of code was duplicated from neural_mt during speedy prototyping -- CLEAN UP
 class InitialContextDecoder(Initializable):
     """
@@ -241,13 +387,13 @@ class InitialContextDecoder(Initializable):
         self.theano_seed = theano_seed
 
         # Initialize gru with special initial state
-        self.target_transition = target_transition(
+        self.transition = target_transition(
             attended_dim=state_dim, context_dim=context_dim, dim=state_dim,
             activation=Tanh(), name='decoder')
 
-        self.transition = GRUInitialStateWithInitialStateConcatContext(
-            attended_dim=state_dim, context_dim=context_dim, dim=state_dim,
-            activation=Tanh(), name='decoder')
+        # self.transition = GRUInitialStateWithInitialStateConcatContext(
+        #     attended_dim=state_dim, context_dim=context_dim, dim=state_dim,
+        #     activation=Tanh(), name='decoder')
 
         # Initialize the attention mechanism
         self.attention = SequenceContentAttention(
@@ -282,19 +428,25 @@ class InitialContextDecoder(Initializable):
                 fork=Fork([name for name in self.transition.apply.sequences
                            if name != 'mask'], prototype=Linear())
             )
-            #         elif loss_function == 'min_risk':
-            #             self.sequence_generator = MinRiskSequenceGenerator(
-            #                 readout=readout,
-            #                 transition=self.transition,
-            #                 attention=self.attention,
-            #                 fork=Fork([name for name in self.transition.apply.sequences
-            #                            if name != 'mask'], prototype=Linear())
-            #             )
-            # the name is important, because it lets us match the brick hierarchy names for the vanilla SequenceGenerator
-            # to load pretrained models
-            self.sequence_generator.name = 'sequencegenerator'
+        elif loss_function == 'min_risk':
+            self.sequence_generator = MinRiskInitialContextSequenceGenerator(
+                readout=readout,
+                transition=self.transition,
+                attention=self.attention,
+                fork=Fork([name for name in self.transition.apply.sequences
+                           if name != 'mask'], prototype=Linear())
+            )
+        # the name is important, because it lets us match the brick hierarchy names for the vanilla SequenceGenerator
+        # to load pretrained models
+            # TODO: quick hack to fix bug
+            self.sequence_generator.name = 'initialcontextsequencegenerator'
+
+
         else:
             raise ValueError('The decoder does not support the loss function: {}'.format(loss_function))
+
+        # TODO: uncomment this!!
+        # self.sequence_generator.name = 'sequencegenerator'
 
         self.children = [self.sequence_generator]
 
@@ -319,15 +471,16 @@ class InitialContextDecoder(Initializable):
 
         return (cost * target_sentence_mask).sum() / target_sentence_mask.shape[1]
 
-        # Note: this requires the decoder to be using sequence_generator which implements expected cost
-    #     @application(inputs=['representation', 'source_sentence_mask',
-    #                          'target_samples_mask', 'target_samples', 'scores'],
-    #                  outputs=['cost'])
-    #     def expected_cost(self, representation, source_sentence_mask, target_samples, target_samples_mask, scores,
-    #                       **kwargs):
-    #         return self.sequence_generator.expected_cost(representation,
-    #                                                      source_sentence_mask,
-    #                                                      target_samples, target_samples_mask, scores, **kwargs)
+    # Note: this requires the decoder to be using sequence_generator which implements expected cost
+    # Note: initial_state_context is passed through in the kwargs
+    @application(inputs=['representation', 'source_sentence_mask',
+                         'target_samples_mask', 'target_samples', 'scores'],
+                 outputs=['cost'])
+    def expected_cost(self, representation, source_sentence_mask, target_samples, target_samples_mask, scores,
+                      **kwargs):
+        return self.sequence_generator.expected_cost(representation,
+                                                     source_sentence_mask,
+                                                     target_samples, target_samples_mask, scores, **kwargs)
 
 
     @application

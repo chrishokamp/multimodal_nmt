@@ -21,6 +21,7 @@ from blocks.main_loop import MainLoop
 from blocks.model import Model
 from blocks.select import Selector
 from blocks.search import BeamSearch
+from blocks.roles import WEIGHT
 from blocks_extras.extensions.plot import Plot
 
 from machine_translation.checkpoint import CheckpointNMT, LoadNMT
@@ -29,8 +30,8 @@ from machine_translation.stream import _ensure_special_tokens
 
 from mmmt.model import InitialContextDecoder
 # user can specify which target GRU they want
-from mmmt.model import GRUInitialStateWithInitialStateConcatContext, GRUInitialStateWithInitialStateSumContext
-from mmmt.sample import BleuValidator, Sampler, SamplingBase
+from mmmt.model import GRUInitialState, GRUInitialStateWithInitialStateConcatContext, GRUInitialStateWithInitialStateSumContext
+from mmmt.sample import BleuValidator, Sampler, SamplingBase, MeteorValidator
 
 try:
     from blocks_extras.extensions.plot import Plot
@@ -40,7 +41,6 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# TODO: add the multimodal NMT __main__ function here, need to slice up the prototype script
 def main(config, tr_stream, dev_stream, source_vocab, target_vocab, use_bokeh=False):
 
     # Create Theano variables
@@ -73,9 +73,6 @@ def main(config, tr_stream, dev_stream, source_vocab, target_vocab, use_bokeh=Fa
 
     cost.name = 'decoder_cost'
 
-    logger.info('Creating computational graph')
-    cg = ComputationGraph(cost)
-
     # Initialize model
     logger.info('Initializing model')
     encoder.weights_init = decoder.weights_init = IsotropicGaussian(
@@ -88,6 +85,24 @@ def main(config, tr_stream, dev_stream, source_vocab, target_vocab, use_bokeh=Fa
     encoder.initialize()
     decoder.initialize()
 
+    logger.info('Creating computational graph')
+    cg = ComputationGraph(cost)
+
+    # GRAPH TRANSFORMATIONS FOR BETTER TRAINING
+    # TODO: validate performance with/without regularization
+    if config.get('l2_regularization', False) is True:
+        l2_reg_alpha = config['l2_regularization_alpha']
+        logger.info('Applying l2 regularization with alpha={}'.format(l2_reg_alpha))
+        model_weights = VariableFilter(roles=[WEIGHT])(cg.variables)
+
+        for W in model_weights:
+            cost = cost + (l2_reg_alpha * (W ** 2).sum())
+
+        # why do we need to name the cost variable? Where did the original name come from?
+        cost.name = 'decoder_cost_cost'
+
+    cg = ComputationGraph(cost)
+
     # apply dropout for regularization
     if config['dropout'] < 1.0:
         # dropout is applied to the output of maxout in ghog
@@ -97,20 +112,7 @@ def main(config, tr_stream, dev_stream, source_vocab, target_vocab, use_bokeh=Fa
                           if x.name == 'maxout_apply_output']
         cg = apply_dropout(cg, dropout_inputs, config['dropout'])
 
-    # Apply weight noise for regularization
-    if config['weight_noise_ff'] > 0.0:
-        logger.info('Applying weight noise to ff layers')
-        enc_params = Selector(encoder.lookup).get_parameters().values()
-        enc_params += Selector(encoder.fwd_fork).get_parameters().values()
-        enc_params += Selector(encoder.back_fork).get_parameters().values()
-        dec_params = Selector(
-            decoder.sequence_generator.readout).get_parameters().values()
-        dec_params += Selector(
-            decoder.sequence_generator.fork).get_parameters().values()
-        dec_params += Selector(decoder.transition.initial_transformer).get_parameters().values()
-        cg = apply_noise(cg, enc_params+dec_params, config['weight_noise_ff'])
 
-    # TODO: weight noise for recurrent params isn't currently implemented -- see config['weight_noise_rec']
     # Print shapes
     shapes = [param.get_value().shape for param in cg.parameters]
     logger.info("Parameter shapes: ")
@@ -152,9 +154,8 @@ def main(config, tr_stream, dev_stream, source_vocab, target_vocab, use_bokeh=Fa
     sampling_input = tensor.lmatrix('input')
     sampling_context = tensor.matrix('context_input')
 
-    # WORKING: change this part to account for the new initial context for decoder
     # Set up beam search and sampling computation graphs if necessary
-    if config['hook_samples'] >= 1 or config['bleu_script'] is not None:
+    if config['hook_samples'] >= 1 or config.get('bleu_script', None) is not None:
         logger.info("Building sampling model")
         sampling_representation = encoder.apply(
             sampling_input, tensor.ones(sampling_input.shape))
@@ -166,7 +167,6 @@ def main(config, tr_stream, dev_stream, source_vocab, target_vocab, use_bokeh=Fa
                 ComputationGraph(generated[1]))  # generated[1] is next_outputs
 
     # Add sampling
-    # TODO: currently commented because we need to modify the sampler to use the contexts
     if config['hook_samples'] >= 1:
         logger.info("Building sampler")
         extensions.append(
@@ -179,9 +179,8 @@ def main(config, tr_stream, dev_stream, source_vocab, target_vocab, use_bokeh=Fa
                    ))
 
 
-    # TODO: add sampling_context to BleuValidator and Sampler
     # Add early stopping based on bleu
-    if config['bleu_script'] is not None:
+    if config.get('bleu_script', None) is not None:
         logger.info("Building bleu validator")
         extensions.append(
             BleuValidator(sampling_input, sampling_context, samples=samples, config=config,
@@ -191,6 +190,20 @@ def main(config, tr_stream, dev_stream, source_vocab, target_vocab, use_bokeh=Fa
                           normalize=config['normalized_bleu'],
                           every_n_batches=config['bleu_val_freq']))
 
+    
+    # Add early stopping based on Meteor
+    if config.get('meteor_directory', None) is not None:
+        logger.info("Building meteor validator")
+        extensions.append(
+            MeteorValidator(sampling_input, sampling_context, samples=samples,
+                            config=config,
+                            model=search_model, data_stream=dev_stream,
+                            src_vocab=source_vocab,
+                            trg_vocab=target_vocab,
+                            normalize=config['normalized_bleu'],
+                            every_n_batches=config['bleu_val_freq']))
+
+
     # Reload model if necessary
     if config['reload']:
         extensions.append(LoadNMT(config['saveto']))
@@ -198,7 +211,7 @@ def main(config, tr_stream, dev_stream, source_vocab, target_vocab, use_bokeh=Fa
     # Plot cost in bokeh if necessary
     if use_bokeh and BOKEH_AVAILABLE:
         extensions.append(
-            Plot(config['model_save_directory'], channels=[['decoder_cost', 'validation_set_bleu_score']],
+            Plot(config['model_save_directory'], channels=[['decoder_cost', 'validation_set_bleu_score', 'validation_set_meteor_score']],
                  every_n_batches=10))
 
     # Set up training algorithm
@@ -339,7 +352,7 @@ class NMTPredictor:
 
     # WORKING: add the contexts into prediction
     # Contexts are currently *.npz files (need to fit into memory)
-    def predict_files(self, source_input_file, context_input_file, output_file=None):
+    def predict_files(self, source_input_file, context_input_file, output_file=None, output_costs=False):
         tokenize = self.tokenizer_cmd is not None
         detokenize = self.detokenizer_cmd is not None
 
@@ -376,7 +389,10 @@ class NMTPredictor:
                 nbest_costs = costs[:self.n_best]
 
                 if self.n_best == 1:
-                    ftrans.write((nbest_translations[0] + '\n').decode('utf8'))
+                    if output_costs:
+                        ftrans.write((nbest_translations[0] + '\t' + str(nbest_costs[0]) + '\n').decode('utf8'))
+                    else:
+                        ftrans.write((nbest_translations[0] + '\n').decode('utf8'))
                     total_cost += nbest_costs[0]
                 else:
                     # one blank line to separate each nbest list
