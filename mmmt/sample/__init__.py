@@ -33,7 +33,6 @@ theano.config.on_unused_input = 'warn'
 
 import numpy
 
-# TODO: implement this function for MMMT
 class SampleFunc:
 
     def __init__(self, sample_func, vocab):

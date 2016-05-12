@@ -107,7 +107,6 @@ def get_dev_stream_with_context_features(val_context_features=None, val_set=None
             cPickle.load(open(src_vocab)),
             bos_idx=0, eos_idx=src_vocab_size - 1, unk_idx=unk_id)
 
-        # TODO: how is the dev dataset used without the context features?
         dev_dataset = TextFile([val_set], src_vocab, None)
 
         # now add the source with the image features
@@ -126,7 +125,6 @@ def get_dev_stream_with_context_features(val_context_features=None, val_set=None
 
 
 # Module for functionality associated with streaming data
-# TODO: modify this to pass the correct args for multimodal initial context
 class MMMTSampleStreamTransformer:
     """
     Stateful transformer which takes a stream of (source, target) and adds the sources ('samples', 'scores')
@@ -178,8 +176,6 @@ class MMMTSampleStreamTransformer:
         return self.score_func(source, reference, samples, **kwargs)
 
 
-
-# TODO: duplicate the initial context as well
 class CopySourceAndContextNTimes(Transformer):
     """Duplicate the source N times to match the number of samples
 
