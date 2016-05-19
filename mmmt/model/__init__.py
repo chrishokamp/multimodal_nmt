@@ -176,7 +176,6 @@ class GRUInitialStateWithInitialStateConcatContext(GatedRecurrent):
 # TODO: Note that AttentionRecurrent is currently _hacked_ in blocks to remove 'initial_state_context' from the
 # TODO: kwargs in the `compute_states` function
 # TODO: this hack will need to be redone every time blocks is updated/re-installed
-# Working: implement expected_cost for this sequence generator, follow nnmt.models
 class InitialContextSequenceGenerator(BaseSequenceGenerator):
 
     def __init__(self, readout, transition, attention,
