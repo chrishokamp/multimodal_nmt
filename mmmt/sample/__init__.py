@@ -347,7 +347,7 @@ class BleuValidator(SimpleExtension, SamplingBase):
 
     def _is_valid_to_save(self, bleu_score):
         if not self.best_models or min(self.best_models,
-                                       key=operator.attrgetter('score')).bleu_score < bleu_score:
+                                       key=operator.attrgetter('score')).score < bleu_score:
             return True
         return False
 
