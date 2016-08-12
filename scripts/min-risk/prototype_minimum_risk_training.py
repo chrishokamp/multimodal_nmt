@@ -39,8 +39,6 @@ from blocks.main_loop import MainLoop
 from blocks.model import Model
 from blocks.select import Selector
 from blocks.roles import WEIGHT
-from blocks.search import BeamSearch
-from blocks_extras.extensions.plot import Plot
 
 from machine_translation.checkpoint import CheckpointNMT, LoadNMT
 from machine_translation.model import BidirectionalEncoder, Decoder
@@ -49,7 +47,6 @@ from machine_translation.stream import (_ensure_special_tokens,
                                         get_textfile_stream, _too_long, _length, PaddingWithEOS,
                                         _oov_to_unk, FlattenSamples)
 
-# TODO: these need to be implemented for multimodal min_risk as well
 from machine_translation.evaluation import sentence_level_bleu, sentence_level_meteor
 
 from mmmt.sample import SampleFunc, BleuValidator, MeteorValidator
@@ -269,7 +266,6 @@ training_stream = Merge([training_stream, train_image_stream],
 #                          predicate=_too_long(seq_len=exp_config['seq_len']))
 
 # TODO: configure min-risk score func from the yaml config
-# BLEU
 
 # METEOR
 trg_ivocab = {v:k for k,v in trg_vocab.items()}
@@ -284,6 +280,7 @@ if min_risk_score_func == 'meteor':
                                                        lang=exp_config['target_lang'],
                                                        meteor_directory=exp_config['meteor_directory']
                                                       )
+# BLEU
 else:
     sampling_transformer = MMMTSampleStreamTransformer(sampling_func,
                                                        sentence_level_bleu,
